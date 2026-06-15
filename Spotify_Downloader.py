@@ -246,9 +246,11 @@ def load_config() -> dict:
         # avoiding the hard throttle/ban on librespot's shared keymaster token.
         "spotify_client_id": "",
         "spotify_client_secret": "",
-        # Optional Netscape cookies.txt from a YouTube Premium account. Attached ONLY
-        # to yt-dlp DOWNLOAD invocations (never search) to surface the Premium-only
-        # ~256 kbps formats (774 Opus / 141 AAC). "" = disabled (anonymous, ~128 kbps).
+        # Optional Netscape cookies.txt from a YouTube Premium account. Attached to
+        # both the yt-dlp SEARCH and DOWNLOAD calls: cookies clear YouTube's bot wall
+        # on the search endpoint for a flagged IP, and the download surfaces the
+        # Premium-only ~256 kbps formats (774 Opus / 141 AAC). "" = disabled
+        # (anonymous, ~128 kbps).
         "youtube_cookies_file": "",
         "youtube_max_concurrency": 4,
         "youtube_random_sleep": False,
@@ -929,6 +931,7 @@ class MusicScraper(QThread):
         prefer_extended=False,
         source_title=None,
         logger=None,
+        cookiefile=None,
     ):
         """Return the best YouTube watch URL for a search, or None.
 
@@ -940,6 +943,14 @@ class MusicScraper(QThread):
         This avoids second-guessing a correct top result and accidentally
         preferring a same-length-but-wrong edit (sped-up, nightcore, remix).
         Skips entries with no usable id.
+
+        *cookiefile*, when set, authenticates the flat-search request so
+        YouTube's "confirm you're not a bot" wall on the search endpoint (the
+        ``[youtube:search] Incomplete data received`` failure) clears for a
+        flagged IP. Only the cookie file is threaded in: the download step's
+        ``player_client`` extractor_args govern the per-video player extractor,
+        are inert under ``extract_flat``, and ``web_music`` could reroute a flat
+        search to YouTube Music — so the search authenticates with cookies only.
         """
         select_opts = {
             "quiet": True,
@@ -951,6 +962,8 @@ class MusicScraper(QThread):
             "socket_timeout": 15,
             "concurrent_fragment_downloads": 4,
         }
+        if cookiefile:
+            select_opts["cookiefile"] = cookiefile
         if self.youtube_random_sleep:
             select_opts["sleep_interval_requests"] = 0.75
         if logger is not None:
@@ -1064,38 +1077,45 @@ class MusicScraper(QThread):
 
         expected_path = None if passthrough else base + "." + fmt_info["ext"]
 
-        tripped_once = False
-        while True:
-            decision = self._yt_rate_gate.before_attempt()
-            if decision == "CANCEL":
-                raise RuntimeError("download cancelled")
+        # Snapshot the cookie file ONCE per call (not per retry attempt) so the SAME
+        # authenticated snapshot is shared by every search and every download below.
+        # The search leg is the one YouTube blocks first with the bot wall, so the
+        # cookies must reach _select_youtube_match too — not just the download.
+        cookie_tmp = None
+        extractor_args = None
+        if self.youtube_cookies_file:
+            problem = validate_cookies_file(self.youtube_cookies_file)
+            if problem is None:
+                try:
+                    cookie_tmp = _snapshot_cookiefile(self.youtube_cookies_file)
+                except (OSError, RuntimeError):
+                    problem = "file changed or became unreadable"
+            if problem is None:
+                # web_music is only auto-added for music.youtube.com URLs; Setlist
+                # downloads www.youtube.com watch URLs, so request it explicitly to
+                # surface the Premium-only formats 774/141. "default" keeps yt-dlp's
+                # version-appropriate client list as the fallback. Applied to the
+                # DOWNLOAD only (see _select_youtube_match for why the search gets
+                # the cookie file but not these client args).
+                extractor_args = {"youtube": {"player_client": ["web_music", "default"]}}
+            else:
+                self._warn_cookies_ignored(problem)
 
-            logger = _YtRateLimitLogger()
-            attempt_opts = dict(ydl_opts)
-            attempt_opts["logger"] = logger
-            if tripped_once:
-                attempt_opts["concurrent_fragment_downloads"] = 1
+        try:
+            tripped_once = False
+            while True:
+                decision = self._yt_rate_gate.before_attempt()
+                if decision == "CANCEL":
+                    raise RuntimeError("download cancelled")
 
-            cookie_tmp = None
-            try:
-                if self.youtube_cookies_file:
-                    problem = validate_cookies_file(self.youtube_cookies_file)
-                    if problem is None:
-                        try:
-                            cookie_tmp = _snapshot_cookiefile(self.youtube_cookies_file)
-                        except (OSError, RuntimeError):
-                            problem = "file changed or became unreadable"
-                    if problem is None:
-                        attempt_opts["cookiefile"] = cookie_tmp
-                        # web_music is only auto-added for music.youtube.com URLs; Setlist
-                        # downloads www.youtube.com watch URLs, so request it explicitly to
-                        # surface the Premium-only formats 774/141. "default" keeps yt-dlp's
-                        # version-appropriate client list as the fallback.
-                        attempt_opts["extractor_args"] = {
-                            "youtube": {"player_client": ["web_music", "default"]}
-                        }
-                    else:
-                        self._warn_cookies_ignored(problem)
+                logger = _YtRateLimitLogger()
+                attempt_opts = dict(ydl_opts)
+                attempt_opts["logger"] = logger
+                if tripped_once:
+                    attempt_opts["concurrent_fragment_downloads"] = 1
+                if cookie_tmp:
+                    attempt_opts["cookiefile"] = cookie_tmp
+                    attempt_opts["extractor_args"] = extractor_args
 
                 # Primary query (widened to 5 results), then a simplified fallback if
                 # the first pass produced nothing. For each, pick the duration-closest
@@ -1111,6 +1131,7 @@ class MusicScraper(QThread):
                         prefer_extended=pe,
                         source_title=source_title,
                         logger=logger,
+                        cookiefile=cookie_tmp,
                     )
                     if not video_url:
                         continue
@@ -1159,10 +1180,10 @@ class MusicScraper(QThread):
                     )
                 self._yt_rate_gate.after_clear()
                 raise RuntimeError("no playable audio source found on YouTube for this track")
-            finally:
-                if cookie_tmp:
-                    with contextlib.suppress(OSError):
-                        os.remove(cookie_tmp)
+        finally:
+            if cookie_tmp:
+                with contextlib.suppress(OSError):
+                    os.remove(cookie_tmp)
 
     def _warn_cookies_ignored(self, problem):
         with self._counter_lock:
@@ -2591,8 +2612,9 @@ class SettingsPanel(QWidget):
         "gain nothing. Accepts a Netscape cookies.txt, a JSON cookie export, or a raw "
         "Cookie header string — export from a private/incognito window logged into "
         "YouTube, then close that window (YouTube rotates cookies in open sessions). "
-        "Cookies are used only for downloads, never for searches, and also apply when "
-        "other sources fall back to YouTube. Using your account with a downloader can "
+        "Cookies authenticate both the search and the download (clearing YouTube's "
+        '"confirm you\'re not a bot" wall on search when your IP is flagged), and also '
+        "apply when other sources fall back to YouTube. Using your account with a downloader can "
         "put it at risk — a separate account is recommended. Requires the deno "
         "JavaScript runtime (brew install deno) — without it YouTube rejects "
         "authenticated downloads."

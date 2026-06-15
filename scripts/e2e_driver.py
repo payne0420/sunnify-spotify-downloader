@@ -67,7 +67,7 @@ def main():
     p.add_argument(
         "--cookies-file",
         default="",
-        help="path to a YouTube Premium cookies.txt; download-only",
+        help="path to a YouTube cookies.txt; authenticates both search and download",
     )
     p.add_argument(
         "--fallback-order",

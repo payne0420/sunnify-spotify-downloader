@@ -936,7 +936,7 @@ class TestExtendedMixDownload:
         assert result == dest
         assert used_extended is False
         mock_select.assert_any_call(
-            extended_q, 210, prefer_extended=True, source_title=None, logger=ANY
+            extended_q, 210, prefer_extended=True, source_title=None, logger=ANY, cookiefile=None
         )
         mock_select.assert_any_call(
             "ytsearch5:Song Artist audio",
@@ -944,6 +944,7 @@ class TestExtendedMixDownload:
             prefer_extended=False,
             source_title=None,
             logger=ANY,
+            cookiefile=None,
         )
 
     def test_extended_leg_reports_used_extended_true(self, tmp_path):
@@ -2470,7 +2471,11 @@ class TestYoutubePremiumCookies:
         assert "cookiefile" not in opts
         assert "extractor_args" not in opts
 
-    def test_search_opts_never_get_cookies(self, tmp_path):
+    def test_search_opts_get_cookiefile_when_set(self, tmp_path):
+        # Regression guard for the bot-wall-on-search bug: when a cookie file is
+        # configured, the SEARCH (_select_youtube_match) request must carry it, using
+        # the SAME snapshot as the download. player_client extractor_args stay
+        # download-only (inert under extract_flat; web_music could reroute the search).
         from Spotify_Downloader import MusicScraper
 
         cookie_path = _valid_cookie_file(tmp_path)
@@ -2503,8 +2508,188 @@ class TestYoutubePremiumCookies:
         assert search_opts
         assert download_opts
         for opts in search_opts:
+            assert opts["cookiefile"] != cookie_path  # private snapshot, not the user's file
+            assert "extractor_args" not in opts  # player_client is download-only
+        for opts in download_opts:
+            assert opts["cookiefile"] != cookie_path
+            assert opts["extractor_args"] == {
+                "youtube": {"player_client": ["web_music", "default"]}
+            }
+        # Same snapshot path shared by search and download.
+        assert search_opts[0]["cookiefile"] == download_opts[0]["cookiefile"]
+
+    def test_search_and_download_share_one_snapshot(self, tmp_path):
+        # The cookie file is snapshotted exactly ONCE per download_track_audio call —
+        # not once for the search plus once for the download.
+        from Spotify_Downloader import MusicScraper
+        from Spotify_Downloader import _snapshot_cookiefile as real_snapshot
+
+        cookie_path = _valid_cookie_file(tmp_path)
+        scraper = MusicScraper(youtube_cookies_file=cookie_path)
+        dest = str(tmp_path / "track.mp3")
+        snapshots = []
+
+        def counting_snapshot(src):
+            path = real_snapshot(src)
+            snapshots.append(path)
+            return path
+
+        def ydl_factory(opts):
+            mock = MagicMock()
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            if opts.get("extract_flat"):
+                mock.extract_info = MagicMock(
+                    return_value={"entries": [{"id": "abc", "title": "Song", "duration": 180}]}
+                )
+            else:
+                mock.extract_info = MagicMock(return_value={"format_id": "251"})
+            return mock
+
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch("Spotify_Downloader._snapshot_cookiefile", side_effect=counting_snapshot),
+            patch("Spotify_Downloader.YoutubeDL", side_effect=ydl_factory),
+            patch("os.path.exists", return_value=True),
+        ):
+            scraper.download_track_audio("Song Artist", dest, expected_duration_s=180)
+
+        assert len(snapshots) == 1
+
+    def test_snapshot_taken_once_across_retries(self, tmp_path):
+        # A gate retry (two outer attempts) must NOT re-snapshot: the snapshot is lifted
+        # out of the retry loop and reused by every attempt's search + download.
+        from Spotify_Downloader import MusicScraper
+        from Spotify_Downloader import _snapshot_cookiefile as real_snapshot
+
+        cookie_path = _valid_cookie_file(tmp_path)
+        scraper = MusicScraper(youtube_cookies_file=cookie_path)
+        scraper._yt_rate_gate.COOLDOWN_S = 0.05
+        scraper._yt_rate_gate.SLICE_S = 0.01
+        dest = str(tmp_path / "Song.mp3")
+        snapshots = []
+        search_attempts = 0
+        download_attempts = 0
+
+        def counting_snapshot(src):
+            path = real_snapshot(src)
+            snapshots.append(path)
+            return path
+
+        class FakeYdl:
+            def __init__(self, opts):
+                self._opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, _url, download=False):
+                nonlocal search_attempts, download_attempts
+                if not download:
+                    search_attempts += 1
+                    logger = self._opts["logger"]  # strict: must be threaded in
+                    if search_attempts == 1:
+                        logger.error(
+                            "This content isn't available, try again later — rate-limited by YouTube"
+                        )
+                        return {"entries": []}
+                    return {"entries": [{"id": "abc", "title": "Song Artist", "duration": 200}]}
+                download_attempts += 1
+                return None
+
+        def exists(path):
+            return path == dest and download_attempts >= 1
+
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch("Spotify_Downloader._snapshot_cookiefile", side_effect=counting_snapshot),
+            patch.object(scraper, "_build_youtube_download_plan", return_value=[("q", False)]),
+            patch("Spotify_Downloader.YoutubeDL", FakeYdl),
+            patch("os.path.exists", side_effect=exists),
+        ):
+            result, _ = scraper.download_track_audio("ytsearch1:Song Artist audio", dest)
+        assert result == dest
+        assert search_attempts == 2  # the retry loop ran
+        assert len(snapshots) == 1  # but the cookie file was snapshotted only once
+
+    def test_search_opts_anonymous_when_cookies_unset(self, tmp_path):
+        # No cookies configured -> the search opts must be byte-for-byte anonymous,
+        # exactly as before this fix (no behavior change for the default path).
+        from Spotify_Downloader import MusicScraper
+
+        scraper = MusicScraper()
+        dest = str(tmp_path / "track.mp3")
+        all_opts = []
+
+        def ydl_factory(opts):
+            all_opts.append(opts)
+            mock = MagicMock()
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            if opts.get("extract_flat"):
+                mock.extract_info = MagicMock(
+                    return_value={"entries": [{"id": "abc", "title": "Song", "duration": 180}]}
+                )
+            else:
+                mock.extract_info = MagicMock(return_value={"format_id": "251"})
+            return mock
+
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch("Spotify_Downloader.YoutubeDL", side_effect=ydl_factory),
+            patch("os.path.exists", return_value=True),
+        ):
+            scraper.download_track_audio("Song Artist", dest, expected_duration_s=180)
+
+        search_opts = [o for o in all_opts if o.get("extract_flat")]
+        assert search_opts
+        for opts in search_opts:
             assert "cookiefile" not in opts
             assert "extractor_args" not in opts
+
+    def test_invalid_cookie_search_and_download_anonymous(self, tmp_path):
+        # An unrecognized cookie file warns once and proceeds anonymously on BOTH legs.
+        from Spotify_Downloader import MusicScraper
+
+        bad = tmp_path / "bad.txt"
+        bad.write_text('{"json": "garbage"}')
+        scraper = MusicScraper(youtube_cookies_file=str(bad))
+        messages = []
+        scraper.error_signal.connect(messages.append)
+        dest = str(tmp_path / "track.mp3")
+        all_opts = []
+
+        def ydl_factory(opts):
+            all_opts.append(opts)
+            mock = MagicMock()
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            if opts.get("extract_flat"):
+                mock.extract_info = MagicMock(
+                    return_value={"entries": [{"id": "abc", "title": "Song", "duration": 180}]}
+                )
+            else:
+                mock.extract_info = MagicMock(return_value={"format_id": "251"})
+            return mock
+
+        with (
+            patch("Spotify_Downloader.get_ffmpeg_path", return_value="/usr/bin"),
+            patch("Spotify_Downloader.YoutubeDL", side_effect=ydl_factory),
+            patch("os.path.exists", return_value=True),
+        ):
+            scraper.download_track_audio("Song Artist", dest, expected_duration_s=180)
+
+        search_opts = [o for o in all_opts if o.get("extract_flat")]
+        download_opts = [o for o in all_opts if not o.get("extract_flat")]
+        assert search_opts
+        assert download_opts
+        for opts in search_opts + download_opts:
+            assert "cookiefile" not in opts
+            assert "extractor_args" not in opts
+        assert len([m for m in messages if "ignored" in m]) == 1
 
     def test_premium_format_reported_once(self, tmp_path):
         from Spotify_Downloader import MusicScraper
