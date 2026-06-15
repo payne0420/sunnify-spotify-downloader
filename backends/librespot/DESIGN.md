@@ -109,6 +109,32 @@ All claims below were read from that commit's source, not the goal's illustrativ
   peer` line is the access-point Mercury session self-healing upstream (`Receiver` catches it,
   `session.reconnect()` picks a new AP, re-auths, and spawns a fresh `Receiver`). The permanent
   hang was the CDN byte stream, not the AP session — now fixed by the CDN + wait-predicate shims.
+  The single-line `Failed reading packet!` logger line is benign and intentionally left alone.
+  **Reconnect-resilience patch:** pinned `Session.reconnect` (`core.py:1241`) resolves exactly ONE
+  random access point and calls `ConnectionHolder.create` → `sock.connect()` once. It runs inside
+  `Session.Receiver.run`'s except-handler when the long-lived Mercury socket drops (`Errno 54`,
+  normal on long runs). If that single AP refuses (`ConnectionRefusedError`, `Errno 61`) or is
+  blackholed, the error escapes the except-handler and out of `run()`, so (a) Python dumps a
+  ~25-line `Exception in thread session-packet-receiver` traceback to the console, and (b) the
+  replacement `Receiver` is never spawned, leaving the session half-dead (closed socket, no packet
+  pump). We monkeypatch `reconnect` onto `Session` from the same guarded call sites (idempotent +
+  locked + `inspect.getsource` markers, all-or-nothing; skip on incompatible upstream; apply and
+  record `source_unavailable` on frozen builds). `_fixed_reconnect` is the pinned source transcribed
+  verbatim except the `ConnectionHolder.create` call is wrapped in a retry loop that resolves a
+  FRESH random AP up to `_RECONNECT_AP_ATTEMPTS` (5) times with bounded exponential backoff
+  (`_RECONNECT_BACKOFF_BASE_S` 0.5s, doubling, capped at `_RECONNECT_BACKOFF_CAP_S` 8s). Only
+  `OSError` (refused/reset/blackholed/DNS) retries; a non-network error propagates immediately, and
+  all attempts exhausted re-raises after the last. Name-mangled privates are reached via the
+  explicit `self._Session__inner` / `_Session__ap_welcome` / `_Session__authenticate_partial` /
+  `_Session__receiver` spellings (a replacement defined outside the class gets no `__name`
+  mangling), exactly like the audio-key patch. `self.connection` is public.
+  **Receiver excepthook (defense-in-depth):** for the rare TOTAL reconnect failure (every AP
+  attempt exhausted), `_receiver_quiet_excepthook` replaces the escaping multi-line traceback with
+  one concise line for the `session-packet-receiver` thread only and delegates every other thread
+  to the previously-installed `threading.excepthook` (so unrelated thread crashes — including
+  pytest's own — are never masked). Install is idempotent and chains the prior hook. Because the
+  hook mutates `threading.excepthook` process-wide, it is installed ONLY at actual-use chokepoints
+  (`login_stored` / `login_oauth` / `load_loaded_stream`), never in the `is_available()` probe.
 - `session.py` — `LibrespotSession`: resolve creds path (QStandardPaths AppConfigLocation,
   chmod 0600), OAuth-or-stored login (delegates to adapter), `is_premium()`, `close()`.
 - `audio.py` — `capture_ogg(stream, dest_tmp, cancel, *, chunk_size=64*1024)`: pure byte pump,

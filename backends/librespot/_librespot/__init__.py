@@ -87,6 +87,29 @@ _AUDIO_KEY_PATCHED = False
 _AUDIO_KEY_PATCH_STATUS: str | None = None
 _AUDIO_KEY_PATCH_LOCK = threading.Lock()
 
+# Reconnect resilience: pinned ``Session.reconnect`` tries ONE random access point and
+# raises out of the receiver thread if it refuses. Retry a FRESH AP a few times.
+_RECONNECT_AP_ATTEMPTS = 5
+_RECONNECT_BACKOFF_BASE_S = 0.5
+_RECONNECT_BACKOFF_CAP_S = 8.0
+
+_RECONNECT_RESILIENCE_PATCHED = False
+_RECONNECT_RESILIENCE_PATCH_STATUS: str | None = None
+_RECONNECT_RESILIENCE_PATCH_LOCK = threading.Lock()
+
+# Guard markers from pinned ``Session.reconnect`` (core.py:1241).
+_BROKEN_RECONNECT_MARKERS = (
+    "self.connection = Session.ConnectionHolder.create(",
+    "ApResolver.get_random_accesspoint(), self.__inner.conf)",
+    "reusable_auth_credentials_type",
+)
+
+# Receiver-thread excepthook (defense-in-depth for a TOTAL reconnect failure).
+_RECEIVER_THREAD_NAME = "session-packet-receiver"
+_EXCEPTHOOK_INSTALLED = False
+_EXCEPTHOOK_LOCK = threading.Lock()
+_PREV_EXCEPTHOOK = None
+
 
 class AudioKeyError(RuntimeError):
     """Raised by the audio-key patch on throttle (``.code`` set) or timeout (``None``)."""
@@ -128,6 +151,11 @@ def cdn_robustness_patch_status() -> str | None:
 def audio_key_patch_status() -> str | None:
     """Patch outcome: ``applied`` | ``skipped_incompatible`` | ``source_unavailable`` | None."""
     return _AUDIO_KEY_PATCH_STATUS
+
+
+def reconnect_resilience_patch_status() -> str | None:
+    """Patch outcome: ``applied`` | ``skipped_incompatible`` | ``source_unavailable`` | None."""
+    return _RECONNECT_RESILIENCE_PATCH_STATUS
 
 
 def _fixed_check_availability(self, chunk: int, wait: bool, halted: bool) -> None:
@@ -376,6 +404,106 @@ def _apply_audio_key_patch() -> None:
         _AUDIO_KEY_PATCHED = True
 
 
+def _fixed_reconnect(self) -> None:
+    """Upstream ``Session.reconnect`` with a multi-AP retry around the socket connect.
+
+    Pinned ``reconnect`` resolves ONE random access point and calls
+    ``ConnectionHolder.create`` exactly once; if that AP refuses (``ConnectionRefusedError``)
+    or is blackholed, the error propagates out of the ``Session.Receiver.run`` except-handler
+    that called us, kills the receiver thread with an uncaught traceback, and leaves the
+    session with a closed socket and no packet pump. We retry ``create`` against a FRESH
+    random AP up to ``_RECONNECT_AP_ATTEMPTS`` times with bounded exponential backoff so a
+    single transient refused/blackholed AP no longer kills the self-heal. Everything else
+    (close old connection, stop old receiver, connect, re-authenticate) is transcribed
+    verbatim from the pinned source.
+    """
+    from librespot.core import ApResolver, Authentication, Session
+
+    if self.connection is not None:
+        self.connection.close()
+        self._Session__receiver.stop()
+    for attempt in range(_RECONNECT_AP_ATTEMPTS):
+        try:
+            self.connection = Session.ConnectionHolder.create(
+                ApResolver.get_random_accesspoint(), self._Session__inner.conf
+            )
+            break
+        except OSError:  # refused / reset / blackholed / DNS — all OSError subclasses
+            if attempt + 1 >= _RECONNECT_AP_ATTEMPTS:
+                raise
+            delay = min(_RECONNECT_BACKOFF_BASE_S * (2**attempt), _RECONNECT_BACKOFF_CAP_S)
+            time.sleep(delay)
+    self.connect()
+    self._Session__authenticate_partial(
+        Authentication.LoginCredentials(
+            typ=self._Session__ap_welcome.reusable_auth_credentials_type,
+            username=self._Session__ap_welcome.canonical_username,
+            auth_data=self._Session__ap_welcome.reusable_auth_credentials,
+        ),
+        True,
+    )
+    self.logger.info(
+        "Re-authenticated as {}!".format(self._Session__ap_welcome.canonical_username)  # noqa: UP032
+    )
+
+
+def _apply_reconnect_resilience_patch() -> None:
+    """Monkeypatch Session.reconnect for multi-AP resilience; idempotent, locked, source-guarded."""
+    global _RECONNECT_RESILIENCE_PATCHED, _RECONNECT_RESILIENCE_PATCH_STATUS
+    if _RECONNECT_RESILIENCE_PATCHED:
+        return
+    with _RECONNECT_RESILIENCE_PATCH_LOCK:
+        if _RECONNECT_RESILIENCE_PATCHED:
+            return
+        from librespot.core import Session
+
+        try:
+            reconnect_source = inspect.getsource(Session.reconnect)
+        except (OSError, TypeError):
+            Session.reconnect = _fixed_reconnect
+            _RECONNECT_RESILIENCE_PATCH_STATUS = PATCH_STATUS_SOURCE_UNAVAILABLE
+            _RECONNECT_RESILIENCE_PATCHED = True
+            return
+        if not all(m in reconnect_source for m in _BROKEN_RECONNECT_MARKERS):
+            _RECONNECT_RESILIENCE_PATCH_STATUS = PATCH_STATUS_SKIPPED_INCOMPATIBLE
+            _RECONNECT_RESILIENCE_PATCHED = True
+            return
+        Session.reconnect = _fixed_reconnect
+        _RECONNECT_RESILIENCE_PATCH_STATUS = PATCH_STATUS_APPLIED
+        _RECONNECT_RESILIENCE_PATCHED = True
+
+
+def _receiver_quiet_excepthook(args) -> None:
+    """Quiet ONLY the librespot ``session-packet-receiver`` thread; delegate all others.
+
+    A total reconnect failure (every AP attempt exhausted) re-raises out of
+    ``Session.Receiver.run`` and would otherwise dump a multi-line traceback to the user's
+    console. Replace it with one concise line; the per-track ``audio.py`` ladder + the
+    fallback chain still handle the affected track. Every other thread is delegated to the
+    previously-installed hook so unrelated crashes are never masked.
+    """
+    thread = getattr(args, "thread", None)
+    if thread is not None and getattr(thread, "name", None) == _RECEIVER_THREAD_NAME:
+        reason = getattr(args, "exc_value", None) or "connection lost"
+        print(f"[*] librespot: Spotify session dropped ({reason}); reconnecting on next track.")
+        return
+    if _PREV_EXCEPTHOOK is not None:
+        _PREV_EXCEPTHOOK(args)
+
+
+def _install_receiver_excepthook() -> None:
+    """Install :func:`_receiver_quiet_excepthook` once, chaining the prior hook."""
+    global _EXCEPTHOOK_INSTALLED, _PREV_EXCEPTHOOK
+    if _EXCEPTHOOK_INSTALLED:
+        return
+    with _EXCEPTHOOK_LOCK:
+        if _EXCEPTHOOK_INSTALLED:
+            return
+        _PREV_EXCEPTHOOK = threading.excepthook
+        threading.excepthook = _receiver_quiet_excepthook
+        _EXCEPTHOOK_INSTALLED = True
+
+
 def is_available() -> bool:
     """True iff the alpha ``librespot`` package and its deps import cleanly.
 
@@ -392,6 +520,7 @@ def is_available() -> bool:
             _apply_check_availability_patch()
             _apply_cdn_robustness_patch()
             _apply_audio_key_patch()
+            _apply_reconnect_resilience_patch()
             _AVAILABLE = True
         except BaseException as exc:  # noqa: BLE001 - any import-time failure disables it
             _AVAILABLE = False
@@ -438,7 +567,9 @@ def login_oauth(
 
     conf = _configuration(credentials_path)
     builder = Session.Builder(conf).set_device_name(device_name)
-    return builder.oauth(on_auth_url, success_page).create()
+    session = builder.oauth(on_auth_url, success_page).create()
+    _install_receiver_excepthook()
+    return session
 
 
 def login_stored(credentials_path: str, *, device_name: str = "Setlist"):
@@ -447,7 +578,9 @@ def login_stored(credentials_path: str, *, device_name: str = "Setlist"):
 
     conf = _configuration(credentials_path)
     builder = Session.Builder(conf).set_device_name(device_name)
-    return builder.stored_file(credentials_path).create()
+    session = builder.stored_file(credentials_path).create()
+    _install_receiver_excepthook()
+    return session
 
 
 def has_stored_credentials(credentials_path: str) -> bool:
@@ -520,6 +653,8 @@ def load_loaded_stream(session, track_id, quality):
     _apply_check_availability_patch()
     _apply_cdn_robustness_patch()
     _apply_audio_key_patch()
+    _apply_reconnect_resilience_patch()
+    _install_receiver_excepthook()
     return session.content_feeder().load(track_id, quality, False, None)
 
 
