@@ -1577,6 +1577,21 @@ class MusicScraper(QThread):
             except OSError:
                 pass
 
+    @staticmethod
+    def _close_track_generator(gen) -> None:
+        """Close a track generator, triggering the provider's GeneratorExit
+        cleanup (its metadata pool shuts down with cancel_futures=True).
+
+        Guarded: providers are generators today (so .close() exists and is a
+        no-op once exhausted), but a plain iterator without .close() must not
+        raise here, and a provider whose cleanup itself errors must not mask
+        the download outcome.
+        """
+        close = getattr(gen, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
     def scrape_playlist(self, spotify_playlist_link, music_folder):
         # Reset mutable state so repeat invocations on the same scraper
         # instance don't carry stale counters or failure lists.
@@ -1625,48 +1640,68 @@ class MusicScraper(QThread):
                 f"Resuming: skipping {len(already_done)} already-downloaded track(s)"
             )
 
-        # Materialize the generator into a list. iter_playlist_tracks is a
-        # generator and generators are not thread-safe. Consuming it upfront
-        # also lets us pick the right worker count based on track count.
-        # Cancel is checked between yields so very large playlists (where
-        # iter_playlist_tracks issues hundreds of spclient + per-track embed
-        # requests serially) can abort mid-fetch instead of waiting through
-        # the full window before the stop button takes effect.
-        expected_total = metadata.track_count or 0
-        tracks: list = []
-        for track in spotify_api.iter_playlist_tracks(
-            playlist_id,
-            content_type=content_type,
-            skip_ids=already_done,
-            on_notice=self.error_signal.emit,
-        ):
-            if self.is_cancelled():
-                break
-            tracks.append(track)
-            if expected_total and len(tracks) % 10 == 0:
-                self.error_signal.emit(
-                    f"Fetching track metadata ({len(tracks)} of {expected_total})..."
-                )
-        self._total_tracks = len(tracks)
-
-        if self.is_cancelled():
-            self.PlaylistCompleted.emit("Download cancelled")
-            return
-
-        self.Resetprogress_signal.emit(0)
-
-        # Small playlists don't benefit from parallelism. Keep 1 worker for
-        # playlists under 3 tracks to preserve the single-track UI feel.
-        worker_count = 1 if len(tracks) < 3 else min(self.MAX_WORKERS, len(tracks))
+        # Pool sizing uses the playlist's declared track_count, fetched up
+        # front (above) before the rate-limited per-track metadata. We no
+        # longer drain the whole generator first: in multi-worker mode each
+        # track is submitted to the download pool the moment its metadata is
+        # yielded, so downloads overlap the still-running metadata fetch
+        # instead of waiting behind the "Fetching track metadata" barrier.
+        raw_total = metadata.track_count
+        expected_total = raw_total if isinstance(raw_total, int) and raw_total > 0 else 0
+        # Tracks still to download this run = declared total minus those a
+        # prior run already finished (resume). When the count is unknown
+        # (0/None) we can't tell a tiny playlist from a huge one, so assume
+        # parallel and let the backend clamp decide the real ceiling.
+        remaining = max(0, expected_total - len(already_done)) if expected_total else 0
+        if expected_total:
+            # Small playlists don't benefit from parallelism. Keep 1 worker for
+            # under 3 downloadable tracks to preserve the single-track UI feel.
+            worker_count = 1 if remaining < 3 else min(self.MAX_WORKERS, remaining)
+        else:
+            worker_count = self.MAX_WORKERS
         # Clamp to what the active backend can safely run in parallel (e.g. a
         # single-session backend declares max_concurrency = 1). YouTube = 4, so
         # this is a no-op for the default source.
         worker_count = min(
             worker_count, getattr(self._backend, "max_concurrency", self.MAX_WORKERS)
         )
+        worker_count = max(1, worker_count)
         self._parallel_mode = worker_count > 1
 
+        gen = spotify_api.iter_playlist_tracks(
+            playlist_id,
+            content_type=content_type,
+            skip_ids=already_done,
+            on_notice=self.error_signal.emit,
+        )
+
         if worker_count == 1:
+            # Single-worker path: tiny playlists and single-session backends
+            # (librespot). Preserve today's behavior exactly — fully resolve
+            # metadata first, then download sequentially with per-track UI. A
+            # single Spotify session must not interleave metadata and download
+            # work, and tiny playlists keep the single-track feel. Cancel is
+            # checked between yields so a large-but-serialized playlist can
+            # abort mid-fetch instead of waiting through the full window.
+            tracks: list = []
+            try:
+                for track in gen:
+                    if self.is_cancelled():
+                        break
+                    tracks.append(track)
+                    if expected_total and len(tracks) % 10 == 0:
+                        self.error_signal.emit(
+                            f"Fetching track metadata ({len(tracks)} of {expected_total})..."
+                        )
+            finally:
+                self._close_track_generator(gen)
+            self._total_tracks = len(tracks)
+
+            if self.is_cancelled():
+                self.PlaylistCompleted.emit("Download cancelled")
+                return
+
+            self.Resetprogress_signal.emit(0)
             for idx, track in enumerate(tracks, start=1):
                 if self.is_cancelled():
                     break
@@ -1677,18 +1712,51 @@ class MusicScraper(QThread):
                     track, playlist_folder_path, metadata.cover_url, track_num=idx
                 )
         else:
+            # Streaming parallel path: submit each track to the download pool
+            # as its metadata is yielded, so the first download starts after
+            # the FIRST track resolves instead of waiting for the whole
+            # playlist. _total_tracks starts as the resume-adjusted estimate
+            # (smooth early progress) and is corrected to the exact submitted
+            # count once the generator is exhausted, so the aggregate bar still
+            # reaches 100% even if track_count was imperfect.
+            self.Resetprogress_signal.emit(0)
+            self._total_tracks = remaining
+            submitted = 0
+            denominator_corrected = False
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = [
-                        executor.submit(
-                            self._download_one_track,
-                            track,
-                            playlist_folder_path,
-                            metadata.cover_url,
-                            idx,
-                        )
-                        for idx, track in enumerate(tracks, start=1)
-                    ]
+                    futures = []
+                    try:
+                        for track in gen:
+                            if self.is_cancelled():
+                                break
+                            submitted += 1
+                            futures.append(
+                                executor.submit(
+                                    self._download_one_track,
+                                    track,
+                                    playlist_folder_path,
+                                    metadata.cover_url,
+                                    submitted,
+                                )
+                            )
+                            if expected_total and submitted % 10 == 0:
+                                self.error_signal.emit(
+                                    f"Fetching track metadata ({submitted} of {expected_total})..."
+                                )
+                    finally:
+                        # Closing the generator propagates GeneratorExit into
+                        # the provider so its metadata pool shuts down with
+                        # cancel_futures=True instead of blocking on hundreds of
+                        # pending fetches on cancel.
+                        self._close_track_generator(gen)
+                    # Producer exhausted (or cancelled). Correct the progress
+                    # denominator to the true number of submitted downloads so
+                    # the "X of N" label and aggregate bar reflect real work,
+                    # not the declared track_count estimate.
+                    if not self.is_cancelled():
+                        denominator_corrected = submitted != self._total_tracks
+                        self._total_tracks = submitted
                     for future in concurrent.futures.as_completed(futures):
                         if self.is_cancelled():
                             # Cancel remaining futures that haven't started
@@ -1707,6 +1775,22 @@ class MusicScraper(QThread):
                             msg = f"Unexpected worker error: {exc}"
                             print(f"[*] {msg}")
                             self.error_signal.emit(msg)
+                    else:
+                        # All downloads finished without a cancel. When the
+                        # declared track_count mis-estimated the work, workers
+                        # that completed before the denominator correction
+                        # computed their percent/count against the stale
+                        # estimate, so the bar could be stuck below 100 and the
+                        # label off. Emit one corrective UI update against the
+                        # now-exact totals. Skipped when the estimate was right
+                        # (the common case), so steady-state emits stay one
+                        # per track. Re-check cancel: the loop's only cancel
+                        # check is inside its body, so a Stop in the window
+                        # between the last iteration and this else must not emit
+                        # a 100% just before the run reports "cancelled".
+                        if denominator_corrected and submitted > 0 and not self.is_cancelled():
+                            self.dlprogress_signal.emit(100)
+                            self.count_updated.emit(self.counter)
             finally:
                 # Reset parallel_mode only after the executor has fully shut
                 # down (context manager exit waits on in-flight workers). If
