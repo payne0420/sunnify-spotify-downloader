@@ -3156,3 +3156,231 @@ class TestBackendPacing:
                 cancel=cancel,
             )
         assert sum(delays) < 10.0
+
+
+# --------------------------------------------------------------------------- #
+# Reconnect resilience + receiver excepthook
+# --------------------------------------------------------------------------- #
+
+
+# Captured at import time, while ``Session.reconnect`` is still the pristine pinned function
+# (before any test that calls the real ``is_available()`` / ``load_loaded_stream()`` can apply
+# the monkeypatch process-wide). The fixture restores THIS so the source-guarded "applies on
+# pinned source" test always sees the unpatched upstream source regardless of test order.
+try:  # pragma: no cover - exercised only when the alpha librespot lib is installed
+    import librespot.core as _core_for_pristine
+
+    _PRISTINE_RECONNECT = _core_for_pristine.Session.reconnect
+except Exception:  # noqa: BLE001 - lib absent: the reconnect tests importorskip anyway
+    _PRISTINE_RECONNECT = None
+
+
+@pytest.fixture
+def _reconnect_state(monkeypatch):
+    """Snapshot/restore the module globals + ``Session.reconnect`` + ``threading.excepthook``.
+
+    The reconnect patch and the receiver excepthook both mutate process-wide state
+    (``librespot.core.Session.reconnect`` and ``threading.excepthook``); without an explicit
+    restore the mutation would leak into the rest of the suite (including pytest's own threads).
+    The test BODY is seeded with the pristine pinned function captured at import time (so the
+    source-guarded "applies on pinned source" test sees unpatched upstream markers regardless of
+    order), but ``finally`` restores the ACTUAL pre-test ``Session.reconnect`` so it stays
+    consistent with the restored ``_RECONNECT_RESILIENCE_PATCHED`` flag and nothing leaks.
+    """
+    core = pytest.importorskip("librespot.core")
+
+    saved = {
+        "patched": adapter._RECONNECT_RESILIENCE_PATCHED,
+        "status": adapter._RECONNECT_RESILIENCE_PATCH_STATUS,
+        "installed": adapter._EXCEPTHOOK_INSTALLED,
+        "prev": adapter._PREV_EXCEPTHOOK,
+    }
+    # Restore the ACTUAL pre-test reconnect (which may already be the applied
+    # ``_fixed_reconnect`` if an earlier test ran the real ``is_available()``), so the
+    # restored ``Session.reconnect`` stays consistent with the restored ``_RECONNECT_
+    # RESILIENCE_PATCHED`` flag and nothing leaks. The test BODY still starts from the
+    # pristine pinned source so the source-guarded "applies on pinned source" test sees
+    # the unpatched upstream markers regardless of order.
+    saved_reconnect = core.Session.reconnect
+    pristine_reconnect = _PRISTINE_RECONNECT or saved_reconnect
+    saved_excepthook = threading.excepthook
+    core.Session.reconnect = pristine_reconnect
+    try:
+        yield core
+    finally:
+        adapter._RECONNECT_RESILIENCE_PATCHED = saved["patched"]
+        adapter._RECONNECT_RESILIENCE_PATCH_STATUS = saved["status"]
+        adapter._EXCEPTHOOK_INSTALLED = saved["installed"]
+        adapter._PREV_EXCEPTHOOK = saved["prev"]
+        core.Session.reconnect = saved_reconnect
+        threading.excepthook = saved_excepthook
+
+
+class _FakeReconnectSession:
+    """Minimal stand-in for a librespot ``Session`` exercised by ``_fixed_reconnect``.
+
+    Exposes the public ``connection`` plus the name-mangled privates the patch reaches via
+    the explicit ``_Session__*`` spellings, and records ``connect`` / authenticate calls.
+    """
+
+    def __init__(self):
+        self.connection = SimpleNamespace(close=lambda: self.closed.append(True))
+        self.closed: list[bool] = []
+        self._Session__receiver = SimpleNamespace(stop=lambda: self.stopped.append(True))
+        self.stopped: list[bool] = []
+        self._Session__inner = SimpleNamespace(conf=object())
+        # ``typ`` flows into a real ``Authentication.LoginCredentials`` protobuf, so it must be a
+        # valid ``AuthenticationType`` enum value (1 == AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS);
+        # ``auth_data`` must be bytes.
+        self._Session__ap_welcome = SimpleNamespace(
+            reusable_auth_credentials_type=1,
+            canonical_username="alice",
+            reusable_auth_credentials=b"creds",
+        )
+        self.connect_calls = 0
+        self.authenticate_calls: list[tuple] = []
+        self.logger = SimpleNamespace(info=lambda *_a, **_k: None)
+
+    def connect(self):
+        self.connect_calls += 1
+
+    def _Session__authenticate_partial(self, credentials, ap_welcome):
+        self.authenticate_calls.append((credentials, ap_welcome))
+
+
+class TestReconnectResilience:
+    """Guards the multi-AP reconnect shim + the receiver-thread excepthook in ``_librespot``."""
+
+    def test_fixed_reconnect_retries_fresh_ap_after_refused(self, _reconnect_state, monkeypatch):
+        core = _reconnect_state
+        aps = iter(["ap-1", "ap-2", "ap-3"])
+        used_aps: list[str] = []
+        stub_connection = object()
+        create_calls: list[str] = []
+
+        def fake_create(ap, _conf):
+            create_calls.append(ap)
+            if len(create_calls) == 1:
+                raise ConnectionRefusedError(61, "Connection refused")
+            return stub_connection
+
+        def fake_random_ap():
+            ap = next(aps)
+            used_aps.append(ap)
+            return ap
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(core.Session.ConnectionHolder, "create", staticmethod(fake_create))
+        monkeypatch.setattr(core.ApResolver, "get_random_accesspoint", fake_random_ap)
+        monkeypatch.setattr(adapter.time, "sleep", lambda s: sleeps.append(s))
+
+        session = _FakeReconnectSession()
+        adapter._fixed_reconnect(session)
+
+        # create called twice, against the two distinct fresh APs
+        assert create_calls == ["ap-1", "ap-2"]
+        assert create_calls[0] != create_calls[1]
+        assert session.connect_calls == 1
+        assert len(session.authenticate_calls) == 1
+        assert session.connection is stub_connection
+        assert sleeps == [adapter._RECONNECT_BACKOFF_BASE_S]
+
+    def test_fixed_reconnect_raises_after_all_aps_refused(self, _reconnect_state, monkeypatch):
+        core = _reconnect_state
+        create_calls: list[object] = []
+
+        def fake_create(ap, _conf):  # noqa: ARG001
+            create_calls.append(ap)
+            raise ConnectionRefusedError(61, "Connection refused")
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(core.Session.ConnectionHolder, "create", staticmethod(fake_create))
+        monkeypatch.setattr(core.ApResolver, "get_random_accesspoint", lambda: "ap", raising=True)
+        monkeypatch.setattr(adapter.time, "sleep", lambda s: sleeps.append(s))
+
+        session = _FakeReconnectSession()
+        with pytest.raises(ConnectionRefusedError):
+            adapter._fixed_reconnect(session)
+
+        assert len(create_calls) == adapter._RECONNECT_AP_ATTEMPTS
+        assert session.connect_calls == 0
+        assert len(sleeps) == adapter._RECONNECT_AP_ATTEMPTS - 1
+
+    def test_reconnect_patch_applies_on_pinned_source(self, _reconnect_state):
+        core = _reconnect_state
+        adapter._RECONNECT_RESILIENCE_PATCHED = False
+        adapter._RECONNECT_RESILIENCE_PATCH_STATUS = None
+
+        adapter._apply_reconnect_resilience_patch()
+
+        assert adapter.reconnect_resilience_patch_status() == adapter.PATCH_STATUS_APPLIED
+        assert core.Session.reconnect is adapter._fixed_reconnect
+
+    def test_reconnect_patch_skips_incompatible_source(self, _reconnect_state, monkeypatch):
+        core = _reconnect_state
+        original_reconnect = core.Session.reconnect
+        adapter._RECONNECT_RESILIENCE_PATCHED = False
+        adapter._RECONNECT_RESILIENCE_PATCH_STATUS = None
+        monkeypatch.setattr(adapter.inspect, "getsource", lambda _fn: "def reconnect(self): pass")
+
+        adapter._apply_reconnect_resilience_patch()
+
+        assert (
+            adapter.reconnect_resilience_patch_status() == adapter.PATCH_STATUS_SKIPPED_INCOMPATIBLE
+        )
+        assert core.Session.reconnect is original_reconnect
+
+    def test_reconnect_patch_source_unavailable(self, _reconnect_state, monkeypatch):
+        core = _reconnect_state
+        adapter._RECONNECT_RESILIENCE_PATCHED = False
+        adapter._RECONNECT_RESILIENCE_PATCH_STATUS = None
+
+        def raise_getsource(_fn):
+            raise OSError("source code not available")
+
+        monkeypatch.setattr(adapter.inspect, "getsource", raise_getsource)
+
+        adapter._apply_reconnect_resilience_patch()
+
+        assert (
+            adapter.reconnect_resilience_patch_status() == adapter.PATCH_STATUS_SOURCE_UNAVAILABLE
+        )
+        assert core.Session.reconnect is adapter._fixed_reconnect
+
+    def test_receiver_excepthook_quiets_only_receiver_thread(self, _reconnect_state, capsys):
+        delegated: list = []
+        adapter._PREV_EXCEPTHOOK = lambda args: delegated.append(args)
+
+        receiver_args = SimpleNamespace(
+            thread=SimpleNamespace(name="session-packet-receiver"),
+            exc_value=ConnectionRefusedError(61, "Connection refused"),
+        )
+        adapter._receiver_quiet_excepthook(receiver_args)
+        out = capsys.readouterr().out
+        assert "Spotify session dropped" in out
+        assert delegated == []
+
+        other_args = SimpleNamespace(
+            thread=SimpleNamespace(name="other"),
+            exc_value=RuntimeError("boom"),
+        )
+        adapter._receiver_quiet_excepthook(other_args)
+        assert delegated == [other_args]
+
+    def test_install_receiver_excepthook_idempotent_and_chains(self, _reconnect_state):
+        adapter._EXCEPTHOOK_INSTALLED = False
+        adapter._PREV_EXCEPTHOOK = None
+
+        def sentinel(_args):
+            pass
+
+        threading.excepthook = sentinel
+
+        adapter._install_receiver_excepthook()
+        assert threading.excepthook is adapter._receiver_quiet_excepthook
+        assert adapter._PREV_EXCEPTHOOK is sentinel
+
+        # second install is a no-op: still our hook, prev unchanged
+        adapter._install_receiver_excepthook()
+        assert threading.excepthook is adapter._receiver_quiet_excepthook
+        assert adapter._PREV_EXCEPTHOOK is sentinel
